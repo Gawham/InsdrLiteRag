@@ -517,6 +517,8 @@ class PostgreSQLDB:
         except (
             asyncpg.exceptions.InvalidSchemaNameError,
             asyncpg.exceptions.UniqueViolationError,
+            asyncpg.exceptions.DuplicateObjectError,
+            asyncpg.exceptions.DuplicateSchemaError,
         ):
             pass
 
@@ -2646,7 +2648,7 @@ class PGVectorStorage(BaseVectorStorage):
             if workspace_count == 0 and not (
                 table_name.lower() == legacy_table_name.lower()
             ):
-                logger.warning(
+                logger.info(
                     f"PostgreSQL: workspace data in table '{table_name}' is empty. "
                     f"Ensure it is caused by new workspace setup and not an unexpected embedding model change."
                 )
@@ -3909,10 +3911,18 @@ class PGGraphStorage(BaseGraphStorage):
             # Ensure names comply with PostgreSQL identifier specifications
             safe_workspace = re.sub(r"[^a-zA-Z0-9_]", "_", workspace.strip())
             safe_namespace = re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
-            return f"{safe_workspace}_{safe_namespace}"
+            name = f"{safe_workspace}_{safe_namespace}"
         else:
             # When the workspace is "default", use the namespace directly (for backward compatibility with legacy implementations)
-            return re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
+            name = re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
+        # AGE graph names are PostgreSQL schema names — cannot start with a digit
+        if name and name[0].isdigit():
+            name = f"_{name}"
+        # PostgreSQL normalizes unquoted identifiers to lowercase. Since all SQL
+        # queries reference {graph_name}.base / {graph_name}."DIRECTED" without
+        # quoting the schema part, the lookup is always lowercased. Ensure the
+        # name used for create_graph() matches by lowercasing here.
+        return name.lower()
 
     @staticmethod
     def _normalize_node_id(node_id: str) -> str:
@@ -3993,6 +4003,90 @@ class PGGraphStorage(BaseGraphStorage):
                     ignore_if_exists=True,  # Pass the new flag
                     with_age=True,
                     graph_name=self.graph_name,
+                )
+
+            # Health check: verify the 'base' vertex-label table physically exists.
+            # A previous crashed initialization can leave the AGE catalog entry for
+            # 'base' intact while the actual table is absent — create_vlabel then
+            # silently no-ops (sees "already exists") and the graph stays broken
+            # indefinitely.  Detect this state and repair it by dropping the graph
+            # and letting the standard query loop recreate everything cleanly.
+            #
+            # Migration: Before the lowercase-normalization fix, graph schemas could be
+            # created with mixed-case names (e.g. "ldcvJ1CX_chunk_entity_relation")
+            # while SQL queries reference them as unquoted identifiers (lowercased by
+            # PostgreSQL). If the lowercase graph doesn't exist but a mixed-case
+            # variant does, drop the old one so it doesn't linger as an orphan and
+            # let the recreation loop below build a clean lowercase schema.
+            async with self.db.pool.acquire() as _conn:
+                base_exists = await _conn.fetchval(
+                    "SELECT EXISTS ("
+                    "  SELECT 1 FROM information_schema.tables"
+                    "  WHERE table_schema = $1 AND table_name = 'base'"
+                    ")",
+                    self.graph_name,
+                )
+                if not base_exists:
+                    # Check for a legacy mixed-case schema whose lowercase matches ours
+                    old_schema = await _conn.fetchval(
+                        "SELECT nspname FROM pg_namespace"
+                        " WHERE lower(nspname) = $1 AND nspname <> $1"
+                        " LIMIT 1",
+                        self.graph_name,
+                    )
+                    if old_schema:
+                        logger.warning(
+                            f"[{self.workspace}] Found legacy mixed-case graph schema "
+                            f"'{old_schema}'. Dropping it so a clean lowercase schema "
+                            f"'{self.graph_name}' can be created."
+                        )
+                        try:
+                            await _conn.execute(
+                                'SET search_path = ag_catalog, "$user", public'
+                            )
+                            await _conn.execute(
+                                f"SELECT drop_graph('{old_schema}', true)"
+                            )
+                        except Exception as _legacy_drop_err:
+                            logger.warning(
+                                f"[{self.workspace}] drop_graph for legacy schema "
+                                f"'{old_schema}' failed (continuing): {_legacy_drop_err}"
+                            )
+
+            if not base_exists:
+                logger.warning(
+                    f"[{self.workspace}] Graph '{self.graph_name}' is corrupted: "
+                    f"'base' label table is missing. Dropping and recreating graph..."
+                )
+                # drop_graph needs ag_catalog in the search path
+                async with self.db.pool.acquire() as _conn:
+                    try:
+                        await _conn.execute(
+                            'SET search_path = ag_catalog, "$user", public'
+                        )
+                        await _conn.execute(
+                            f"SELECT drop_graph('{self.graph_name}', true)"
+                        )
+                    except Exception as _drop_err:
+                        logger.warning(
+                            f"[{self.workspace}] drop_graph failed (continuing): {_drop_err}"
+                        )
+
+                # Recreate the graph and its required labels
+                for query in [
+                    f"SELECT create_graph('{self.graph_name}')",
+                    f"SELECT create_vlabel('{self.graph_name}', 'base');",
+                    f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');",
+                ]:
+                    await self.db.execute(
+                        query,
+                        upsert=True,
+                        ignore_if_exists=True,
+                        with_age=True,
+                        graph_name=self.graph_name,
+                    )
+                logger.info(
+                    f"[{self.workspace}] Graph '{self.graph_name}' recreated successfully."
                 )
 
     async def finalize(self):

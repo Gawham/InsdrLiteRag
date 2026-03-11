@@ -1701,7 +1701,7 @@ class LightRAG:
             else:
                 # Another process is busy, just set request flag and return
                 pipeline_status["request_pending"] = True
-                logger.info(
+                logger.debug(
                     "Another process is already processing the document queue. Request queued."
                 )
                 return

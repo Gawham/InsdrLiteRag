@@ -12,7 +12,12 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from functools import lru_cache
-from typing import Any
+from typing import Any, Callable, Optional
+
+# Injected by rag_service.py. Plain mutable dict (not a ContextVar) so that
+# updating it is immediately visible to all tasks, including long-lived
+# LightRAG pipeline tasks created in a prior batch's context.
+cost_callback_ctx: dict = {"callback": None}
 
 import numpy as np
 from tenacity import (
@@ -373,20 +378,35 @@ async def gemini_complete_if_cache(
                 raise exc
             finally:
                 # Track token usage after streaming completes
-                if token_tracker and usage_metadata:
-                    token_tracker.add_usage(
-                        {
-                            "prompt_tokens": getattr(
-                                usage_metadata, "prompt_token_count", 0
-                            ),
-                            "completion_tokens": getattr(
-                                usage_metadata, "candidates_token_count", 0
-                            ),
-                            "total_tokens": getattr(
-                                usage_metadata, "total_token_count", 0
-                            ),
-                        }
-                    )
+                if usage_metadata:
+                    try:
+                        raw = {f: getattr(usage_metadata, f) for f in usage_metadata.__class__.model_fields}
+                    except AttributeError:
+                        raw = {f: getattr(usage_metadata, f, None) for f in (
+                            "prompt_token_count", "candidates_token_count", "cached_content_token_count",
+                            "thoughts_token_count", "total_token_count",
+                        )}
+                    logger.info("[Gemini token usage] %s", raw)
+                    callback = cost_callback_ctx["callback"]
+                    if callback:
+                        try:
+                            await callback(raw)
+                        except Exception as _cb_err:
+                            logger.warning("cost_callback failed: %s", _cb_err)
+                    if token_tracker:
+                        token_tracker.add_usage(
+                            {
+                                "prompt_tokens": getattr(
+                                    usage_metadata, "prompt_token_count", 0
+                                ),
+                                "completion_tokens": getattr(
+                                    usage_metadata, "candidates_token_count", 0
+                                ),
+                                "total_tokens": getattr(
+                                    usage_metadata, "total_token_count", 0
+                                ),
+                            }
+                        )
 
         return _async_stream()
 
@@ -422,14 +442,29 @@ async def gemini_complete_if_cache(
     final_text = remove_think_tags(final_text)
 
     usage = getattr(response, "usage_metadata", None)
-    if token_tracker and usage:
-        token_tracker.add_usage(
-            {
-                "prompt_tokens": getattr(usage, "prompt_token_count", 0),
-                "completion_tokens": getattr(usage, "candidates_token_count", 0),
-                "total_tokens": getattr(usage, "total_token_count", 0),
-            }
-        )
+    if usage:
+        try:
+            raw = {f: getattr(usage, f) for f in usage.__class__.model_fields}
+        except AttributeError:
+            raw = {f: getattr(usage, f, None) for f in (
+                "prompt_token_count", "candidates_token_count", "cached_content_token_count",
+                "thoughts_token_count", "total_token_count",
+            )}
+        logger.info("[Gemini token usage] %s", raw)
+        callback = cost_callback_ctx["callback"]
+        if callback:
+            try:
+                await callback(raw)
+            except Exception as _cb_err:
+                logger.warning("cost_callback failed: %s", _cb_err)
+        if token_tracker:
+            token_tracker.add_usage(
+                {
+                    "prompt_tokens": getattr(usage, "prompt_token_count", 0),
+                    "completion_tokens": getattr(usage, "candidates_token_count", 0),
+                    "total_tokens": getattr(usage, "total_token_count", 0),
+                }
+            )
 
     logger.debug("Gemini response length: %s", len(final_text))
     return final_text

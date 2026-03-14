@@ -382,13 +382,16 @@ async def _handle_single_entity_extraction(
     timestamp: int,
     file_path: str = "unknown_source",
 ):
-    if len(record_attributes) != 4 or "entity" not in record_attributes[0]:
-        if len(record_attributes) > 1 and "entity" in record_attributes[0]:
-            logger.warning(
-                f"{chunk_key}: LLM output format error; found {len(record_attributes)}/4 feilds on ENTITY `{record_attributes[1]}` @ `{record_attributes[2] if len(record_attributes) > 2 else 'N/A'}`"
-            )
-            logger.debug(record_attributes)
+    if "entity" not in record_attributes[0]:
         return None
+    if len(record_attributes) < 4:
+        return None
+    if len(record_attributes) > 4:
+        # Gemini inserted the tuple delimiter inside the description — merge overflow fields back
+        logger.debug(
+            f"{chunk_key}: ENTITY `{record_attributes[1]}` had {len(record_attributes)} fields; merging description overflow"
+        )
+        record_attributes = record_attributes[:3] + [" ".join(record_attributes[3:])]
 
     try:
         entity_name = sanitize_and_normalize_extracted_text(
@@ -469,15 +472,17 @@ async def _handle_single_relationship_extraction(
     timestamp: int,
     file_path: str = "unknown_source",
 ):
-    if (
-        len(record_attributes) != 5 or "relation" not in record_attributes[0]
-    ):  # treat "relationship" and "relation" interchangeable
-        if len(record_attributes) > 1 and "relation" in record_attributes[0]:
-            logger.warning(
-                f"{chunk_key}: LLM output format error; found {len(record_attributes)}/5 fields on REALTION `{record_attributes[1]}`~`{record_attributes[2] if len(record_attributes) > 2 else 'N/A'}`"
-            )
-            logger.debug(record_attributes)
+    # treat "relationship" and "relation" interchangeably
+    if "relation" not in record_attributes[0]:
         return None
+    if len(record_attributes) < 5:
+        return None
+    if len(record_attributes) > 5:
+        # Gemini inserted the tuple delimiter inside the description — last field is always weight
+        logger.debug(
+            f"{chunk_key}: RELATION `{record_attributes[1]}`~`{record_attributes[2]}` had {len(record_attributes)} fields; merging description overflow"
+        )
+        record_attributes = record_attributes[:3] + [" ".join(record_attributes[3:-1])] + [record_attributes[-1]]
 
     try:
         source = sanitize_and_normalize_extracted_text(
@@ -1629,6 +1634,19 @@ async def _merge_nodes_then_upsert(
 
     # 1. Get existing node data from knowledge graph
     already_node = await knowledge_graph_inst.get_node(entity_name)
+
+    # Determine whether cross-document description merging is allowed for this node.
+    # If both the current ingestion and the existing node carry a merge_group_id and
+    # those IDs differ, skip LLM summarisation and keep the existing description intact.
+    current_merge_group_id = global_config.get("merge_group_id", "")
+    existing_merge_group_id = (already_node or {}).get("merge_group_id", "")
+
+    should_merge_descriptions = (
+        not current_merge_group_id
+        or not existing_merge_group_id
+        or current_merge_group_id == existing_merge_group_id
+    )
+
     if already_node:
         existing_entity_type = already_node.get("entity_type")
         # Coerce to str before any string operations: non-string values from
@@ -1777,14 +1795,19 @@ async def _merge_nodes_then_upsert(
                 raise PipelineCancelledException("User cancelled during entity summary")
 
     # 8. Get summary description an LLM usage status
-    description, llm_was_used = await _handle_entity_relation_summary(
-        "Entity",
-        entity_name,
-        description_list,
-        GRAPH_FIELD_SEP,
-        global_config,
-        llm_response_cache,
-    )
+    if should_merge_descriptions:
+        description, llm_was_used = await _handle_entity_relation_summary(
+            "Entity",
+            entity_name,
+            description_list,
+            GRAPH_FIELD_SEP,
+            global_config,
+            llm_response_cache,
+        )
+    else:
+        # Different merge groups — keep existing description, do not call LLM
+        description = (already_node or {}).get("description", "") or GRAPH_FIELD_SEP.join(description_list)
+        llm_was_used = False
 
     # 9. Build file_path within MAX_FILE_PATHS
     file_paths_list = []
@@ -1879,6 +1902,12 @@ async def _merge_nodes_then_upsert(
         logger.debug(status_message)
 
     # 11. Update both graph and vector db
+    # Accumulate merge_group_ids: union of existing and current
+    existing_mgids = set((existing_merge_group_id or "").split(GRAPH_FIELD_SEP)) - {""}
+    if current_merge_group_id:
+        existing_mgids.add(current_merge_group_id)
+    accumulated_merge_group_id = GRAPH_FIELD_SEP.join(existing_mgids)
+
     node_data = dict(
         entity_id=entity_name,
         entity_type=entity_type,
@@ -1887,6 +1916,7 @@ async def _merge_nodes_then_upsert(
         file_path=file_path,
         created_at=int(time.time()),
         truncate=truncation_info,
+        merge_group_id=accumulated_merge_group_id,
     )
     await knowledge_graph_inst.upsert_node(
         entity_name,
@@ -1943,6 +1973,18 @@ async def _merge_edges_then_upsert(
     # 1. Get existing edge data from graph storage
     if await knowledge_graph_inst.has_edge(src_id, tgt_id):
         already_edge = await knowledge_graph_inst.get_edge(src_id, tgt_id)
+
+    # Determine whether cross-document description merging is allowed for this edge.
+    current_merge_group_id = global_config.get("merge_group_id", "")
+    existing_merge_group_id = (already_edge or {}).get("merge_group_id", "")
+
+    should_merge_descriptions = (
+        not current_merge_group_id
+        or not existing_merge_group_id
+        or current_merge_group_id == existing_merge_group_id
+    )
+
+    if already_edge:
         # Handle the case where get_edge returns None or missing fields
         if already_edge:
             # Get weight with default 1.0 if missing
@@ -2106,14 +2148,19 @@ async def _merge_edges_then_upsert(
                 )
 
     # 8. Get summary description an LLM usage status
-    description, llm_was_used = await _handle_entity_relation_summary(
-        "Relation",
-        f"({src_id}, {tgt_id})",
-        description_list,
-        GRAPH_FIELD_SEP,
-        global_config,
-        llm_response_cache,
-    )
+    if should_merge_descriptions:
+        description, llm_was_used = await _handle_entity_relation_summary(
+            "Relation",
+            f"({src_id}, {tgt_id})",
+            description_list,
+            GRAPH_FIELD_SEP,
+            global_config,
+            llm_response_cache,
+        )
+    else:
+        # Different merge groups — keep existing description, do not call LLM
+        description = (already_edge or {}).get("description", "") or GRAPH_FIELD_SEP.join(description_list)
+        llm_was_used = False
 
     # 9. Build file_path within MAX_FILE_PATHS limit
     file_paths_list = []
@@ -2377,6 +2424,13 @@ async def _merge_edges_then_upsert(
                         pipeline_status["history_messages"].append(status_message)
 
     edge_created_at = int(time.time())
+
+    # Accumulate merge_group_ids for the edge
+    edge_existing_mgids = set((existing_merge_group_id or "").split(GRAPH_FIELD_SEP)) - {""}
+    if current_merge_group_id:
+        edge_existing_mgids.add(current_merge_group_id)
+    accumulated_edge_merge_group_id = GRAPH_FIELD_SEP.join(edge_existing_mgids)
+
     await knowledge_graph_inst.upsert_edge(
         src_id,
         tgt_id,
@@ -2388,6 +2442,7 @@ async def _merge_edges_then_upsert(
             file_path=file_path,
             created_at=edge_created_at,
             truncate=truncation_info,
+            merge_group_id=accumulated_edge_merge_group_id,
         ),
     )
 

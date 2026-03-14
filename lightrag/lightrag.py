@@ -158,6 +158,9 @@ class LightRAG:
     workspace: str = field(default_factory=lambda: os.getenv("WORKSPACE", ""))
     """Workspace for data isolation. Defaults to empty string if WORKSPACE environment variable is not set."""
 
+    merge_group_id: str = field(default="")
+    """Merge group identifier used to gate cross-document description merging in the knowledge graph."""
+
     # ---
     # TODO: Deprecated, use setup_logger in utils.py instead
     log_level: int | None = field(default=None)
@@ -1699,12 +1702,13 @@ class LightRAG:
                 # Cleaning history_messages without breaking it as a shared list object
                 del pipeline_status["history_messages"][:]
             else:
-                # Another process is busy, just set request flag and return
+                # Another process is busy, set request flag and raise so
+                # callers can detect they did NOT acquire the pipeline lock.
                 pipeline_status["request_pending"] = True
                 logger.debug(
                     "Another process is already processing the document queue. Request queued."
                 )
-                return
+                raise RuntimeError("Pipeline busy: another process holds the processing lock")
 
         try:
             # Process documents until no more documents or requests
@@ -1771,6 +1775,7 @@ class LightRAG:
                 total_files = len(to_process_docs)
                 job_name = f"{path_prefix}[{total_files} files]"
                 pipeline_status["job_name"] = job_name
+                pipeline_status["lock_doc_id"] = first_doc_id
 
                 # Create a counter to track the number of processed files
                 processed_count = 0

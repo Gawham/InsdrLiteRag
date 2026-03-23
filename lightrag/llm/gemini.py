@@ -9,7 +9,11 @@ implementation mirrors the OpenAI helpers while relying on the official
 
 from __future__ import annotations
 
+import asyncio
+import datetime
+import hashlib
 import os
+import time
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from typing import Any, Callable, Optional
@@ -18,6 +22,20 @@ from typing import Any, Callable, Optional
 # updating it is immediately visible to all tasks, including long-lived
 # LightRAG pipeline tasks created in a prior batch's context.
 cost_callback_ctx: dict = {"callback": None}
+# Injected by rag_service.py. Called after every Gemini call with (prompt, response, raw_tokens).
+text_callback_ctx: dict = {"callback": None}
+
+# ---------------------------------------------------------------------------
+# Gemini Context Cache Registry
+# ---------------------------------------------------------------------------
+_CONTEXT_CACHE_MIN_CHARS: int = int(os.getenv("GEMINI_CACHE_MIN_CHARS", "4000"))
+_CONTEXT_CACHE_TTL_SECS: int = int(os.getenv("GEMINI_CACHE_TTL_SECS", "3600"))
+_CONTEXT_CACHE_REFRESH_FRACTION: float = 0.80
+
+# cache_key (sha256[:16] of "{model}:{system_prompt}") -> (cache_name, expiry_ts)
+_context_cache_registry: dict[str, tuple[str, float]] = {}
+# Per-key asyncio.Locks to prevent concurrent cache-creation races
+_context_cache_locks: dict[str, asyncio.Lock] = {}
 
 import numpy as np
 from tenacity import (
@@ -121,14 +139,84 @@ def _ensure_api_key(api_key: str | None) -> str:
     return key
 
 
+async def _get_or_create_context_cache(
+    client: genai.Client,
+    model: str,
+    system_prompt: str,
+) -> str | None:
+    """Return a Gemini context-cache resource name, creating one if needed.
+
+    Returns None on any failure so the caller falls back to system_instruction.
+    """
+    # caches.create requires "models/{name}" prefix per the API docs
+    model_id = model if model.startswith("models/") else f"models/{model}"
+
+    cache_key = hashlib.sha256(f"{model_id}:{system_prompt}".encode()).hexdigest()[:16]
+
+    if cache_key not in _context_cache_locks:
+        _context_cache_locks[cache_key] = asyncio.Lock()
+
+    async with _context_cache_locks[cache_key]:
+        entry = _context_cache_registry.get(cache_key)
+        if entry is not None:
+            cache_name, expiry_ts = entry
+            stale_after = expiry_ts - _CONTEXT_CACHE_TTL_SECS * (1 - _CONTEXT_CACHE_REFRESH_FRACTION)
+            if time.time() < stale_after:
+                logger.debug(
+                    "Reusing context cache '%s' (expires in %.0fs)",
+                    cache_name,
+                    expiry_ts - time.time(),
+                )
+                return cache_name
+            logger.debug("Context cache '%s' near expiry, refreshing.", cache_name)
+            del _context_cache_registry[cache_key]
+
+        try:
+            cache = await client.aio.caches.create(
+                model=model_id,
+                config=types.CreateCachedContentConfig(
+                    system_instruction=system_prompt,
+                    ttl=f"{_CONTEXT_CACHE_TTL_SECS}s",
+                ),
+            )
+            cache_name = cache.name
+            expiry_ts = (
+                cache.expire_time.timestamp()
+                if cache.expire_time is not None
+                else time.time() + _CONTEXT_CACHE_TTL_SECS
+            )
+            _context_cache_registry[cache_key] = (cache_name, expiry_ts)
+            logger.info(
+                "Created Gemini context cache '%s' for model '%s' (prompt_chars=%d)",
+                cache_name,
+                model,
+                len(system_prompt),
+            )
+            return cache_name
+        except Exception as exc:
+            _context_cache_registry.pop(cache_key, None)
+            logger.warning(
+                "Gemini context cache creation failed (%s: %s). "
+                "Falling back to system_instruction.",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+
 def _build_generation_config(
     base_config: dict[str, Any] | None,
     system_prompt: str | None,
     keyword_extraction: bool,
+    cached_content: str | None = None,
 ) -> types.GenerateContentConfig | None:
     config_data = dict(base_config or {})
 
-    if system_prompt:
+    if cached_content:
+        # Use the context-cache resource name; system_instruction is embedded in it.
+        # Setting both simultaneously is an API error.
+        config_data["cached_content"] = cached_content
+    elif system_prompt:
         if config_data.get("system_instruction"):
             config_data["system_instruction"] = (
                 f"{config_data['system_instruction']}\n{system_prompt}"
@@ -283,10 +371,21 @@ async def gemini_complete_if_cache(
     prompt_sections.append(f"[user] {prompt}")
     combined_prompt = "\n".join(prompt_sections)
 
+    # Attempt context caching for long, static system prompts (e.g. entity extraction).
+    # Skip on Vertex AI — different resource namespace. Falls back to system_instruction on any error.
+    _cached_content_name: str | None = None
+    if (
+        system_prompt
+        and len(system_prompt) >= _CONTEXT_CACHE_MIN_CHARS
+        and not os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true"
+    ):
+        _cached_content_name = await _get_or_create_context_cache(client, model, system_prompt)
+
     config_obj = _build_generation_config(
         generation_config,
         system_prompt=system_prompt,
         keyword_extraction=keyword_extraction,
+        cached_content=_cached_content_name,
     )
 
     request_kwargs: dict[str, Any] = {
@@ -304,7 +403,9 @@ async def gemini_complete_if_cache(
             cot_started = False
             initial_content_seen = False
             usage_metadata = None
+            accumulated_output: list[str] = []
 
+            _call_start = time.monotonic()
             try:
                 # Use native async streaming from genai SDK
                 # Note: generate_content_stream returns Awaitable[AsyncIterator], need to await first
@@ -330,6 +431,7 @@ async def gemini_complete_if_cache(
                             # Close COT section if it was active
                             if cot_active:
                                 yield "</think>"
+                                accumulated_output.append("</think>")
                                 cot_active = False
 
                             # Process and yield regular content
@@ -338,12 +440,14 @@ async def gemini_complete_if_cache(
                                     regular_text.encode("utf-8")
                                 )
                             yield regular_text
+                            accumulated_output.append(regular_text)
 
                         # Process thought content
                         if thought_text:
                             if not initial_content_seen and not cot_started:
                                 # Start COT section
                                 yield "<think>"
+                                accumulated_output.append("<think>")
                                 cot_active = True
                                 cot_started = True
 
@@ -354,6 +458,7 @@ async def gemini_complete_if_cache(
                                         thought_text.encode("utf-8")
                                     )
                                 yield thought_text
+                                accumulated_output.append(thought_text)
                     else:
                         # COT disabled - only yield regular content
                         if regular_text:
@@ -362,10 +467,12 @@ async def gemini_complete_if_cache(
                                     regular_text.encode("utf-8")
                                 )
                             yield regular_text
+                            accumulated_output.append(regular_text)
 
                 # Ensure COT is properly closed if still active
                 if cot_active:
                     yield "</think>"
+                    accumulated_output.append("</think>")
                     cot_active = False
 
             except Exception as exc:
@@ -393,6 +500,13 @@ async def gemini_complete_if_cache(
                             await callback(raw)
                         except Exception as _cb_err:
                             logger.warning("cost_callback failed: %s", _cb_err)
+                    text_callback = text_callback_ctx["callback"]
+                    if text_callback:
+                        try:
+                            _duration = round(time.monotonic() - _call_start, 3)
+                            await text_callback(combined_prompt, "".join(accumulated_output), raw, duration_seconds=_duration)
+                        except Exception as _cb_err:
+                            logger.warning("text_callback failed: %s", _cb_err)
                     if token_tracker:
                         token_tracker.add_usage(
                             {
@@ -411,7 +525,9 @@ async def gemini_complete_if_cache(
         return _async_stream()
 
     # Non-streaming: use native async client
+    _call_start = time.monotonic()
     response = await client.aio.models.generate_content(**request_kwargs)
+    _call_duration = round(time.monotonic() - _call_start, 3)
 
     # Extract both regular text and thought text
     regular_text, thought_text = _extract_response_text(response, extract_thoughts=True)
@@ -457,6 +573,12 @@ async def gemini_complete_if_cache(
                 await callback(raw)
             except Exception as _cb_err:
                 logger.warning("cost_callback failed: %s", _cb_err)
+        text_callback = text_callback_ctx["callback"]
+        if text_callback:
+            try:
+                await text_callback(combined_prompt, final_text, raw, duration_seconds=_call_duration)
+            except Exception as _cb_err:
+                logger.warning("text_callback failed: %s", _cb_err)
         if token_tracker:
             token_tracker.add_usage(
                 {

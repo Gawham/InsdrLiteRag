@@ -1625,6 +1625,7 @@ async def _merge_nodes_then_upsert(
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
+    entity_vdb_buffer: dict | None = None,
 ):
     """Get existing nodes from knowledge graph use name,if exists, merge data, else create, then upsert."""
     already_entity_types = []
@@ -1935,13 +1936,16 @@ async def _merge_nodes_then_upsert(
                 "file_path": file_path,
             }
         }
-        await safe_vdb_operation_with_exception(
-            operation=lambda payload=data_for_vdb: entity_vdb.upsert(payload),
-            operation_name="entity_upsert",
-            entity_name=entity_name,
-            max_retries=3,
-            retry_delay=0.1,
-        )
+        if entity_vdb_buffer is not None:
+            entity_vdb_buffer.update(data_for_vdb)
+        else:
+            await safe_vdb_operation_with_exception(
+                operation=lambda payload=data_for_vdb: entity_vdb.upsert(payload),
+                operation_name="entity_upsert",
+                entity_name=entity_name,
+                max_retries=3,
+                retry_delay=0.1,
+            )
     return node_data
 
 
@@ -1959,6 +1963,8 @@ async def _merge_edges_then_upsert(
     added_entities: list = None,  # New parameter to track entities added during edge processing
     relation_chunks_storage: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
+    entity_vdb_buffer: dict | None = None,
+    rel_vdb_buffer: dict | None = None,
 ):
     if src_id == tgt_id:
         return None
@@ -2300,13 +2306,16 @@ async def _merge_edges_then_upsert(
                         "file_path": file_path,
                     }
                 }
-                await safe_vdb_operation_with_exception(
-                    operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
-                    operation_name="added_entity_upsert",
-                    entity_name=need_insert_id,
-                    max_retries=3,
-                    retry_delay=0.1,
-                )
+                if entity_vdb_buffer is not None:
+                    entity_vdb_buffer.update(vdb_data)
+                else:
+                    await safe_vdb_operation_with_exception(
+                        operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
+                        operation_name="added_entity_upsert",
+                        entity_name=need_insert_id,
+                        max_retries=3,
+                        retry_delay=0.1,
+                    )
 
             # Track entities added during edge processing
             if added_entities is not None:
@@ -2406,13 +2415,16 @@ async def _merge_edges_then_upsert(
                             ),
                         }
                     }
-                    await safe_vdb_operation_with_exception(
-                        operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
-                        operation_name="existing_entity_update",
-                        entity_name=need_insert_id,
-                        max_retries=3,
-                        retry_delay=0.1,
-                    )
+                    if entity_vdb_buffer is not None:
+                        entity_vdb_buffer.update(vdb_data)
+                    else:
+                        await safe_vdb_operation_with_exception(
+                            operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
+                            operation_name="existing_entity_update",
+                            entity_name=need_insert_id,
+                            max_retries=3,
+                            retry_delay=0.1,
+                        )
 
             # 6. Log once at the end if any update occurred
             if updated:
@@ -2484,13 +2496,16 @@ async def _merge_edges_then_upsert(
                 "file_path": file_path,
             }
         }
-        await safe_vdb_operation_with_exception(
-            operation=lambda payload=vdb_data: relationships_vdb.upsert(payload),
-            operation_name="relationship_upsert",
-            entity_name=f"{src_id}-{tgt_id}",
-            max_retries=3,
-            retry_delay=0.2,
-        )
+        if rel_vdb_buffer is not None:
+            rel_vdb_buffer.update(vdb_data)
+        else:
+            await safe_vdb_operation_with_exception(
+                operation=lambda payload=vdb_data: relationships_vdb.upsert(payload),
+                operation_name="relationship_upsert",
+                entity_name=f"{src_id}-{tgt_id}",
+                max_retries=3,
+                retry_delay=0.2,
+            )
 
     return edge_data
 
@@ -2572,6 +2587,10 @@ async def merge_nodes_and_edges(
     graph_max_async = global_config.get("llm_model_max_async", 4) * 2
     semaphore = asyncio.Semaphore(graph_max_async)
 
+    # Buffers for batched VDB upserts — filled during Phase 1 & 2, flushed after Phase 2
+    entity_vdb_buffer: dict = {}
+    rel_vdb_buffer: dict = {}
+
     # ===== Phase 1: Process all entities concurrently =====
     log_message = f"Phase 1: Processing {total_entities_count} entities from {doc_id} (async: {graph_max_async})"
     logger.info(log_message)
@@ -2606,6 +2625,7 @@ async def merge_nodes_and_edges(
                         pipeline_status_lock,
                         llm_response_cache,
                         entity_chunks_storage,
+                        entity_vdb_buffer=entity_vdb_buffer,
                     )
 
                     return entity_data
@@ -2717,6 +2737,8 @@ async def merge_nodes_and_edges(
                         added_entities,  # Pass list to collect added entities
                         relation_chunks_storage,
                         entity_chunks_storage,  # Add entity_chunks_storage parameter
+                        entity_vdb_buffer=entity_vdb_buffer,
+                        rel_vdb_buffer=rel_vdb_buffer,
                     )
 
                     if edge_data is None:
@@ -2792,6 +2814,18 @@ async def merge_nodes_and_edges(
 
         if first_exception is not None:
             raise first_exception
+
+    # ===== Flush batched VDB upserts =====
+    flush_tasks = []
+    if entity_vdb_buffer and entity_vdb is not None:
+        logger.info(f"[Embed] → Batch entity VDB upsert: {len(entity_vdb_buffer)} entities")
+        flush_tasks.append(entity_vdb.upsert(entity_vdb_buffer))
+    if rel_vdb_buffer and relationships_vdb is not None:
+        logger.info(f"[Embed] → Batch relationship VDB upsert: {len(rel_vdb_buffer)} relationships")
+        flush_tasks.append(relationships_vdb.upsert(rel_vdb_buffer))
+    if flush_tasks:
+        await asyncio.gather(*flush_tasks)
+        logger.info(f"[Embed] ✓ VDB batch flush complete ({len(entity_vdb_buffer)} entities, {len(rel_vdb_buffer)} relationships)")
 
     # ===== Phase 3: Update full_entities and full_relations storage =====
     if full_entities_storage and full_relations_storage and doc_id:
